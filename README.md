@@ -18,6 +18,6 @@ Model.CSV (Contains information about various cancer cell lines, including their
 
 OmicsSomaticMutations.CSV (Contains mutation data for the cell lines, including gene mutations and their impacts.)
 
-Must be placed in the data/ directory.
+THESE FILES CAN BE FOUND HERE: https://plus.figshare.com/articles/dataset/DepMap_24Q2_Public/25880521/1
 
 Data Provided in the Repository

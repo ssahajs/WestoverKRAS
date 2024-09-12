@@ -89,22 +89,34 @@ def identify_cell_lines(nsclc_df, kras_mutations, kras_specific_mutations):
     
     return specific_cell_lines, wt_cell_lines
 
+def create_gene_id_mapping(mutations_df):
+    # Create a dictionary mapping EntrezGeneID to HugoSymbol
+    mapping = mutations_df[['EntrezGeneID', 'HugoSymbol']].drop_duplicates().set_index('EntrezGeneID')['HugoSymbol'].to_dict()
+    
+    # For any EntrezGeneID without a HugoSymbol, use the EntrezGeneID as the symbol
+    for gene_id in mutations_df['EntrezGeneID'].unique():
+        if gene_id not in mapping or pd.isna(mapping[gene_id]):
+            mapping[gene_id] = str(gene_id)
+    
+    return mapping
+
 def perform_gea(mutations_df, specific_cell_lines, wt_cell_lines):
     results = {}
+    gene_id_mapping = create_gene_id_mapping(mutations_df)
     for mutation, cell_lines in specific_cell_lines.items():
         if len(cell_lines) == 0 or len(wt_cell_lines) == 0:
             logger.error(f"Cannot perform GEA for {mutation}: One or both groups have no samples")
             results[mutation] = pd.DataFrame()
             continue
         
-        all_genes = mutations_df['HugoSymbol'].unique()
+        all_genes = mutations_df['EntrezGeneID'].unique()
         mutation_mutations = mutations_df[mutations_df['ModelID'].isin(cell_lines['ModelID'])]
         wt_mutations = mutations_df[mutations_df['ModelID'].isin(wt_cell_lines['ModelID'])]
         
         mutation_results = []
         for gene in all_genes:
-            mutation_count = mutation_mutations[mutation_mutations['HugoSymbol'] == gene]['ModelID'].nunique()
-            wt_count = wt_mutations[wt_mutations['HugoSymbol'] == gene]['ModelID'].nunique()
+            mutation_count = mutation_mutations[mutation_mutations['EntrezGeneID'] == gene]['ModelID'].nunique()
+            wt_count = wt_mutations[wt_mutations['EntrezGeneID'] == gene]['ModelID'].nunique()
             
             mutation_freq = mutation_count / len(cell_lines)
             wt_freq = wt_count / len(wt_cell_lines)
@@ -113,7 +125,8 @@ def perform_gea(mutations_df, specific_cell_lines, wt_cell_lines):
                                              [wt_count, len(wt_cell_lines) - wt_count]])
             
             mutation_results.append({
-                'Gene': gene,
+                'EntrezGeneID': gene,
+                'HugoSymbol': gene_id_mapping.get(gene, str(gene)),
                 f'{mutation}_frequency': mutation_freq,
                 'WT_frequency': wt_freq,
                 'p_value': p_value
@@ -128,7 +141,7 @@ def perform_gea(mutations_df, specific_cell_lines, wt_cell_lines):
         
         results[mutation] = significant_results
     
-    return results
+    return results, gene_id_mapping
 
 def get_top_pathways(gea_results):
     top_pathways = {}
@@ -148,7 +161,7 @@ def get_top_pathways(gea_results):
     
     return top_pathways
 
-def create_pie_chart(data, title, output_path):
+def create_pie_chart(data, title, output_path, gene_id_mapping):
     if not data:
         logger.warning("No data available for pie chart")
         return
@@ -159,8 +172,8 @@ def create_pie_chart(data, title, output_path):
     plt.figure(figsize=(12, 8))
     colors = plt.cm.Set3(np.linspace(0, 1, len(data)))
     
-    # Use gene IDs directly without mapping to gene names
-    labels = list(data.keys())
+    # Convert EntrezGeneIDs to HugoSymbols
+    labels = [f"{gene_id_mapping.get(int(gene_id), str(gene_id))} ({gene_id})" for gene_id in data.keys()]
     sizes = list(data.values())
     
     wedges, texts, autotexts = plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', 
@@ -170,7 +183,7 @@ def create_pie_chart(data, title, output_path):
     
     # Improve label visibility
     for text in texts:
-        text.set_fontsize(10)
+        text.set_fontsize(8)
     for autotext in autotexts:
         autotext.set_fontsize(8)
         autotext.set_fontweight('bold')
@@ -219,7 +232,7 @@ def main():
             return
         
         # Perform Gene Enrichment Analysis
-        gea_results = perform_gea(mutations_df, specific_cell_lines, wt_cell_lines)
+        gea_results, gene_id_mapping = perform_gea(mutations_df, specific_cell_lines, wt_cell_lines)
         
         # Get top pathways
         top_pathways = get_top_pathways(gea_results)
@@ -238,7 +251,8 @@ def main():
         for mutation, pathways in top_pathways.items():
             if pathways:
                 create_pie_chart(pathways, f"Top 10 Enriched Pathways in KRAS {mutation} NSCLC Cell Lines Compared to WT", 
-                                 os.path.join(OUTPUT_DIR, f"kras_{mutation.replace('.', '_')}_enriched_pathways.png"))
+                                 os.path.join(OUTPUT_DIR, f"kras_{mutation.replace('.', '_')}_enriched_pathways.png"),
+                                 gene_id_mapping)
             else:
                 logger.warning(f"No enriched pathway data available for pie chart of {mutation}")
         

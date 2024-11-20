@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants
 DATA_DIR = r"C:\Users\Sahaj\Documents\UTSW Westover"
 OUTPUT_DIR = "crc_output"
-P_VALUE_THRESHOLD = 0.05
+P_VALUE_THRESHOLD = 0.25
 TOP_PATHWAYS = 10
 GSEA_PADJ_THRESHOLD = 0.25
 
@@ -31,7 +31,6 @@ def load_data(filename):
         df = pd.read_csv(filepath, low_memory=False)
         logger.info(f"Successfully loaded {filename}")
         logger.info(f"Shape of {filename}: {df.shape}")
-        logger.info(f"Columns in {filename}: {df.columns.tolist()}")
         return df
     except FileNotFoundError:
         logger.error(f"File not found: {filename}")
@@ -56,7 +55,7 @@ def filter_crc(df):
 def filter_kras_mutations(mutations_df, crc_models):
     required_columns = ['ModelID', 'HugoSymbol', 'ProteinChange', 'VepImpact']
     if not all(col in mutations_df.columns for col in required_columns):
-        logger.error(f"Required columns not found in OmicsSomaticMutations.CSV. Columns present: {mutations_df.columns.tolist()}")
+        logger.error(f"Required columns not found in OmicsSomaticMutations.CSV")
         return None, None
     
     kras_mutations = mutations_df[
@@ -76,192 +75,225 @@ def filter_kras_mutations(mutations_df, crc_models):
     
     return kras_mutations, kras_specific_mutations
 
-def identify_cell_lines(crc_df, kras_mutations, kras_specific_mutations):
-    if 'ModelID' not in crc_df.columns:
-        logger.error("ModelID column not found in Colorectal Adenocarcinoma dataframe")
-        return None, None
+def identify_cell_lines(models_df, mutations_df):
+    try:
+        # Read the raw CSV content
+        csv_content = pd.read_csv('Comparisons.csv', header=None)
+        
+        # Find the start of Analysis 1 data
+        start_idx = csv_content[csv_content[0] == 'Sample A'].index[0] + 1
+        
+        # Find the end of Analysis 1 data (start of Analysis 2 or empty rows)
+        end_idx = None
+        for idx in range(start_idx, len(csv_content)):
+            if pd.isna(csv_content.iloc[idx][0]) or 'Analysis 2' in str(csv_content.iloc[idx][0]):
+                end_idx = idx
+                break
+        
+        if end_idx is None:
+            end_idx = len(csv_content)
     
-    specific_cell_lines = {mutation: crc_df[crc_df['ModelID'].isin(df['ModelID'])] for mutation, df in kras_specific_mutations.items()}
-    wt_cell_lines = crc_df[~crc_df['ModelID'].isin(kras_mutations['ModelID'])]
-    
-    for mutation, cell_lines in specific_cell_lines.items():
-        logger.info(f"Number of KRAS {mutation} cell lines: {len(cell_lines)}")
-    logger.info(f"Number of KRAS WT cell lines: {len(wt_cell_lines)}")
-    
-    return specific_cell_lines, wt_cell_lines
-
-def perform_gsea(mutations_df, specific_cell_lines, wt_cell_lines, gene_set_name='c2.cp.kegg_medicus.v2024.1.Hs.symbols.gmt'):
-    results = {}
-    rng = RandomState(42)
-    
-    # Pre-process mutations_df to speed up lookups
-    mutations_df = mutations_df[['ModelID', 'HugoSymbol']].drop_duplicates()
-    
-    for mutation, cell_lines in specific_cell_lines.items():
-        logger.info(f"Starting GSEA analysis for {mutation}")
+        data = csv_content.iloc[start_idx:end_idx].copy()
+        data.columns = ['oncotree_a', 'genotype_a', 'oncotree_b', 'genotype_b']
         
-        if len(cell_lines) == 0 or len(wt_cell_lines) == 0:
-            logger.error(f"Cannot perform GSEA for {mutation}: One or both groups have no samples")
-            results[mutation] = pd.DataFrame()
-            continue
-
-        mutation_models = set(cell_lines['ModelID'].unique())  # Convert to set for faster lookups
-        wt_models = set(wt_cell_lines['ModelID'].unique())
+        # Drop any completely empty rows
+        data = data.dropna(how='all')
+        # Drop header row if it exists
+        data = data[data['oncotree_a'] != 'Oncotree code']
         
-        logger.info(f"Processing {len(mutation_models)} mutant and {len(wt_models)} WT models for {mutation}")
+        logger.info(f"Loaded {len(data)} comparison pairs")
         
-        # Create efficient lookup dictionary
-        model_gene_dict = {}
-        for _, row in mutations_df.iterrows():
-            if row['ModelID'] not in model_gene_dict:
-                model_gene_dict[row['ModelID']] = set()
-            model_gene_dict[row['ModelID']].add(row['HugoSymbol'])
-        
-        # Get all genes efficiently
-        all_genes = set()
-        for genes in model_gene_dict.values():
-            all_genes.update(genes)
-        all_genes.discard('KRAS')
-        all_genes = list(all_genes)  # Convert to list for indexing
-        
-        logger.info(f"Processing {len(all_genes)} genes for {mutation}")
-        
-        # Calculate t-statistics in chunks
-        chunk_size = 1000
-        gene_chunks = [all_genes[i:i + chunk_size] for i in range(0, len(all_genes), chunk_size)]
-        
-        all_scores = []
-        for chunk in gene_chunks:
-            chunk_scores = []
-            for gene in chunk:
-                mut_vals = np.array([1 if gene in model_gene_dict.get(model, set()) else 0 
-                                   for model in mutation_models])
-                wt_vals = np.array([1 if gene in model_gene_dict.get(model, set()) else 0 
-                                  for model in wt_models])
-                
-                t_stat, _ = stats.ttest_ind(mut_vals, wt_vals)
-                chunk_scores.append(t_stat)
+        results = {}
+        for idx, row in data.iterrows():
+            oncotree = row['oncotree_a']
+            wt_genotype = row['genotype_a']
+            mut_genotype = row['genotype_b']
             
-            all_scores.extend(chunk_scores)
+            if pd.isna(oncotree) or pd.isna(wt_genotype) or pd.isna(mut_genotype):
+                continue
+                
+            # Debug logging
+            logger.info(f"Processing comparison: {oncotree} - {mut_genotype}")
+            
+            if ' ' in mut_genotype:
+                gene, mutation_type = mut_genotype.split(' ', 1)
+            else:
+                # Handle cases like KRASG13C
+                gene = ''.join(c for c in mut_genotype if not c.isdigit() and not c.isalpha())
+                mutation_type = mut_genotype[len(gene):]
+            
+            gene = gene.strip()
+            mutation_type = mutation_type.strip()
+            
+            if not mutation_type:
+                logger.warning(f"Could not extract mutation type from {mut_genotype}")
+                continue
+            
+            logger.info(f"Extracted gene: {gene}, mutation: {mutation_type}")
+            
+            # Map Oncotree codes to OncotreePrimaryDisease values
+            oncotree_mapping = {
+                'LUAD': 'Lung Adenocarcinoma',
+                'COAD': 'Colorectal Adenocarcinoma',
+                'PAAD': 'Pancreatic Adenocarcinoma',
+                'PCM': 'Plasma Cell Myeloma',
+                'STAD': 'Stomach Adenocarcinoma',
+                'IHCH': 'Intrahepatic Cholangiocarcinoma',
+                'UCEC': 'Endometrial Carcinoma',
+                'READ': 'Colorectal Adenocarcinoma', #?
+                'MEL': 'Melanoma'
+            }
+            
+            primary_disease = oncotree_mapping.get(oncotree)
+            if not primary_disease:
+                logger.warning(f"No mapping found for Oncotree code: {oncotree}")
+                continue
+            
+            # Get WT cell lines - checking for any mutations in the gene
+            wt_models = models_df[models_df['OncotreePrimaryDisease'] == primary_disease].copy()
+            wt_model_ids = set(wt_models['ModelID'])
+            mutated_model_ids = set(mutations_df[
+                (mutations_df['HugoSymbol'] == gene) &
+                (mutations_df['ModelID'].isin(wt_model_ids))
+            ]['ModelID'])
+            wt_models = wt_models[~wt_models['ModelID'].isin(mutated_model_ids)]
+            
+            # Get mutant cell lines - look for the specific mutation
+            mut_models = models_df[models_df['OncotreePrimaryDisease'] == primary_disease].copy()
+            mut_models = mut_models[mut_models['ModelID'].isin(
+                mutations_df[
+                    (mutations_df['HugoSymbol'] == gene) &
+                    (mutations_df['ProteinChange'].str.contains(mutation_type, na=False, regex=False))
+                ]['ModelID']
+            )]
+            
+            if len(wt_models) > 0 and len(mut_models) > 0:
+                comparison_name = f"{oncotree}_{gene}_{mutation_type}"
+                results[comparison_name] = {
+                    'wt': wt_models,
+                    'mut': mut_models,
+                    'oncotree': oncotree,
+                    'mutation': mutation_type,
+                    'gene': gene
+                }
+                logger.info(f"Found {len(wt_models)} WT and {len(mut_models)} {gene} {mutation_type} models for {oncotree}")
+            else:
+                logger.warning(f"No valid models found for {oncotree} {gene} {mutation_type}")
         
-        # Add jitter
-        scores = np.array(all_scores) + rng.normal(0, 1e-8, size=len(all_scores))
+        if not results:
+            logger.error("No valid comparison pairs found")
+            return None
+            
+        return results
         
-        logger.info(f"Running GSEA prerank for {mutation} with {len(all_genes)} genes")
+    except Exception as e:
+        logger.error(f"Error in identify_cell_lines: {str(e)}")
+        logger.error("Traceback:", exc_info=True)
+        return None
+    
+def perform_gsea(mutations_df, comparison_data, gene_set):
+    mutation_type = comparison_data['mutation']
+    oncotree = comparison_data['oncotree']
+    gene = comparison_data['gene']
+    mut_models = comparison_data['mut']
+    wt_models = comparison_data['wt']
+    
+    logger.info(f"Starting GSEA analysis for {oncotree} {gene} {mutation_type}")
+    
+    try:
+        mutation_models = set(mut_models['ModelID'].unique())
+        wt_models_set = set(wt_models['ModelID'].unique())
         
+        logger.info(f"Processing {len(mutation_models)} mutant and {len(wt_models_set)} WT models")
+        
+        logger.info("Calculating differential mutation frequencies...")
+        
+        mut_counts = mutations_df[mutations_df['ModelID'].isin(mutation_models)].groupby('HugoSymbol')['ModelID'].nunique()
+        wt_counts = mutations_df[mutations_df['ModelID'].isin(wt_models_set)].groupby('HugoSymbol')['ModelID'].nunique()
+        
+        all_genes = sorted(set(mut_counts.index) | set(wt_counts.index))
+        
+        mut_freq = pd.Series(0, index=all_genes)
+        wt_freq = pd.Series(0, index=all_genes)
+        
+        mut_freq[mut_counts.index] = mut_counts / len(mutation_models)
+        wt_freq[wt_counts.index] = wt_counts / len(wt_models_set)
+        
+        gene_list = [g for g in all_genes if mut_freq[g] > wt_freq[g] and g not in {gene, 'KRAS', 'NRAS'}]
+        
+        logger.info(f"Found {len(gene_list)} differentially mutated genes")
+        
+        if not gene_list:
+            logger.warning("No differentially mutated genes found")
+            return pd.DataFrame()
+            
         try:
-            pre_res = gp.prerank(
-                rnk=pd.Series(index=all_genes, data=scores),
-                gene_sets=gene_set_name,
-                threads=4,
-                permutation_num=1000,
+            logger.info("Running enrichr analysis...")
+            enr = gp.enrichr(
+                gene_list=gene_list,
+                gene_sets=gene_set,
                 outdir=None,
-                seed=42,
-                max_size=500,
-                min_size=15
+                no_plot=True,
+                cutoff=GSEA_PADJ_THRESHOLD
             )
             
-            logger.info(f"GSEA prerank completed for {mutation}, processing results")
+            logger.info("Processing enrichr results...")
+            results_df = enr.results
             
-            results_df = pre_res.res2d
-            results_df['Abs_NES'] = abs(results_df['NES'])
-            significant_results = results_df[results_df['FDR q-val'] < 0.25].sort_values('Abs_NES', ascending=False)
+            if results_df.empty:
+                logger.warning("No enrichment results found")
+                return pd.DataFrame()
             
-            logger.info(f"Found {len(significant_results)} significant pathways (FDR q-val < 0.25) for {mutation}")
+            results_df['NES'] = results_df['Combined Score']
+            top_pathways = results_df.nlargest(TOP_PATHWAYS, 'Combined Score')
             
-            top_10_results = significant_results.head(10).copy()
-            
-            if len(top_10_results) < 10:
-                logger.warning(f"Only found {len(top_10_results)} significant pathways for {mutation}")
-            
-            if top_10_results.empty:
-                logger.warning(f"No significant pathways found for {mutation}")
-            else:
-                logger.info(f"Selected top {len(top_10_results)} significant pathways for {mutation}")
-            
-            results[mutation] = top_10_results
+            logger.info(f"Found {len(top_pathways)} significant pathways")
+            return top_pathways
             
         except Exception as e:
-            logger.error(f"Error performing GSEA for {mutation}: {str(e)}")
+            logger.error(f"Error in enrichr analysis: {str(e)}")
             logger.error("Traceback:", exc_info=True)
-            results[mutation] = pd.DataFrame()
-    
-    return results
+            return pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"Error in GSEA analysis: {str(e)}")
+        logger.error("Traceback:", exc_info=True)
+        return pd.DataFrame()
 
-def get_top_pathways(gsea_results, TOP_PATHWAYS=10):
-    top_pathways = {}
-    for mutation, results_df in gsea_results.items():
-        if results_df.empty:
-            logger.warning(f"No pathways found for {mutation}")
-            top_pathways[mutation] = {}
-            continue
-        
-        # Take top 10 pathways based on absolute NES score
-        top_paths = results_df.head(TOP_PATHWAYS)
-        mutation_top_pathways = dict(zip(top_paths['Term'], top_paths['NES']))
-        
-        logger.info(f"Top {len(mutation_top_pathways)} pathways for {mutation}: {', '.join(mutation_top_pathways.keys())}")
-        top_pathways[mutation] = mutation_top_pathways
+def save_results(df, filename):
+    if df is None or df.empty:
+        logger.warning(f"No data to save for {filename}")
+        return
     
-    return top_pathways
-
-def clean_pathway_name(pathway):
-    """Extract meaningful pathway name from the full pathway string."""
-    # Remove common prefixes and split
-    path = pathway.replace('PID_', '').replace('KEGG_', '')
-    parts = re.split(r'[_\s]', path)
-    
-    # Try to find meaningful identifiers (e.g., PLK1, MAPK, etc.)
-    meaningful_parts = []
-    for part in parts:
-        # Look for parts that contain both letters and numbers, or are all caps
-        if (any(c.isalpha() for c in part) and any(c.isdigit() for c in part)) or \
-           (part.isupper() and len(part) >= 2):
-            meaningful_parts.append(part)
-    
-    if meaningful_parts:
-        return meaningful_parts[0]
-    
-    # Fallback: use first part if no meaningful identifier found
-    return parts[0].upper()
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    df.to_csv(filepath, index=False)
+    logger.info(f"Saved results to {filepath}")
 
 def create_gsea_pie_chart(data, title, output_path, n_cell_lines, TOP_PATHWAYS=10):
-    # Convert all values to absolute values
-    valid_data = {k: abs(v) for k, v in data.items() if isinstance(k, str)}
+    if data.empty:
+        logger.warning(f"No data available for pie chart: {title}")
+        return
+    
+    pathways = dict(zip(data['Term'], data['NES']))
+    valid_data = {k: abs(v) for k, v in pathways.items()}
     
     if not valid_data:
         logger.warning(f"No valid pathways found for pie chart: {title}")
         return
-        
-    # Sort by absolute value and get exactly TOP_PATHWAYS
+    
     sorted_items = sorted(valid_data.items(), key=lambda x: x[1], reverse=True)
     top_data = dict(sorted_items[:TOP_PATHWAYS])
     
-    logger.info(f"Creating pie chart with top {TOP_PATHWAYS} pathways for {title}")
+    logger.info(f"Creating pie chart with {len(top_data)} pathways")
     
     plt.figure(figsize=(15, 10))
-    
-    # Generate colors using Pastel1 colormap
     colors = plt.cm.Pastel1(np.linspace(0, 1, len(top_data)))
     
-    # Process pathway names - extract meaningful pathway name
-    labels = []
-    for pathway in top_data.keys():
-        # Remove the KEGG_MEDICUS prefix and get the pathway name before "_TO_"
-        clean_label = pathway.replace('KEGG_MEDICUS_', '')
-        if '_TO_' in clean_label:
-            clean_label = clean_label.split('_TO_')[0]
-        # Keep only the pathway identifier part
-        clean_label = clean_label.split('https://')[0].strip()
-        labels.append(clean_label)
-    
     sizes = list(top_data.values())
-    
-    # Calculate percentages
     total = sum(sizes)
     percentages = [size/total * 100 for size in sizes]
     
-    # Create the pie chart
+    # Create pie chart
     wedges, texts, autotexts = plt.pie(
         sizes,
         colors=colors,
@@ -272,27 +304,24 @@ def create_gsea_pie_chart(data, title, output_path, n_cell_lines, TOP_PATHWAYS=1
         explode=[0.02] * len(sizes)
     )
     
-    # Adjust label positioning
     for i, p in enumerate(wedges):
-        ang = (p.theta2 - p.theta1) / 2. + p.theta1
+        ang = (p.theta2 - p.theta1)/2. + p.theta1
         x = np.cos(np.deg2rad(ang))
         y = np.sin(np.deg2rad(ang))
         
         horizontalalignment = {-1: "right", 1: "left"}[int(np.sign(x))]
-        
-        # Adjust distance based on percentage
         distance = 1.2 if percentages[i] < 10 else 1.15
         x = x * distance
         y = y * distance
         
-        # Format label with pathway name
-        plt.text(x, y, labels[i],
+        wrapped_text = textwrap.fill(list(top_data.keys())[i], width=50)
+        
+        plt.text(x, y, wrapped_text,
                 horizontalalignment=horizontalalignment,
                 verticalalignment="center",
                 fontsize=10,
                 weight='bold')
     
-    # Title formatting
     plt.title(f"{title}\n(n={n_cell_lines})", 
               fontsize=16, 
               fontweight='bold', 
@@ -300,26 +329,14 @@ def create_gsea_pie_chart(data, title, output_path, n_cell_lines, TOP_PATHWAYS=1
               bbox=dict(facecolor='white', edgecolor='none', alpha=0.8))
     
     plt.axis('equal')
-    
-    # Save with high resolution
     plt.savefig(output_path, dpi=300, bbox_inches='tight', pad_inches=0.5, facecolor='white')
     plt.close()
     
-    # Log the pathways included
     logger.info(f"Saved pie chart to {output_path}")
     logger.info(f"Included pathways in {title}:")
-    for label, pct in zip(labels, percentages):
+    for label, pct in zip(top_data.keys(), percentages):
         logger.info(f"{label}: {pct:.1f}%")
 
-def save_results(df, filename):
-    if df is None or df.empty:
-        logger.warning(f"No data to save for {filename}")
-        return
-    
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    df.to_csv(filepath, index=False)
-    logger.info(f"Saved results to {filepath}")
-    
 def main():
     try:
         logger.info("Starting analysis pipeline...")
@@ -338,28 +355,15 @@ def main():
             logger.error("Failed to filter Colorectal Adenocarcinoma models. Exiting.")
             return
         
-        # Filter for KRAS and specific mutations
-        kras_mutations, kras_specific_mutations = filter_kras_mutations(mutations_df, crc_models)
-        if kras_mutations is None or kras_specific_mutations is None:
-            logger.error("Failed to filter KRAS mutations. Exiting.")
-            return
-        
-        # Identify cell lines
-        specific_cell_lines, wt_cell_lines = identify_cell_lines(crc_models, kras_mutations, kras_specific_mutations)
-        if specific_cell_lines is None or wt_cell_lines is None:
-            logger.error("Failed to identify cell lines. Exiting.")
+        # Get comparison pairs
+        comparison_results = identify_cell_lines(models_df, mutations_df)
+        if not comparison_results:
+            logger.error("Failed to identify comparison pairs. Exiting.")
             return
     
-        # Use built-in KEGG gene sets
-        gene_set_name = 'c2.cp.kegg_medicus.v2024.1.Hs.symbols.gmt'
+        # Use the KEGG Medicus gene set
+        gene_set = "c2.cp.kegg_medicus.v2024.1.Hs.symbols.gmt"
         
-        try:
-            gsea_results = perform_gsea(mutations_df, specific_cell_lines, wt_cell_lines, gene_set_name)
-        except Exception as e:
-            logger.error(f"Error performing GSEA: {str(e)}")
-            logger.error("Traceback:", exc_info=True)
-            return
-
         # Create output directory
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -368,39 +372,34 @@ def main():
             logger.error(f"Failed to create output directory: {str(e)}")
             return
 
-        # Process results for each mutation
-        for mutation, results in gsea_results.items():
-            logger.info(f"Processing output for mutation {mutation}")
-            
-            if results.empty:
-                logger.warning(f"No enriched pathways found for {mutation} using KEGG")
-                continue
-
-            # Save CSV results
-            csv_filename = f"crc_{mutation.replace('.', '_')}_KEGG_gsea_results.csv"
-            save_results(results, csv_filename)
-            logger.info(f"Saved CSV results to {csv_filename}")
-
-            # Create and save pie chart
-            pathways = dict(zip(results['Term'], results['NES']))
-            
-            if pathways:
-                output_path = os.path.join(OUTPUT_DIR, f"crc_kras_{mutation.replace('.', '_')}_KEGG_enriched_pathways.png")
-                logger.info(f"Creating pie chart for {mutation} at {output_path}")
+        # Process each comparison pair
+        for comparison_name, comparison_data in comparison_results.items():
+            try:
+                gsea_results = perform_gsea(mutations_df, comparison_data, gene_set)
                 
-                try:
+                if not gsea_results.empty:
+                    # Save CSV results
+                    csv_filename = f"{comparison_name}_KEGG_gsea_results.csv"
+                    save_results(gsea_results, csv_filename)
+
+                    # Create and save pie chart
+                    output_path = os.path.join(OUTPUT_DIR, f"{comparison_name}_KEGG_enriched_pathways.png")
+                    title = f"Enriched Pathways: {comparison_data['oncotree']} {comparison_data['gene']} WT vs {comparison_data['mutation']}"
+                    
                     create_gsea_pie_chart(
-                        pathways, 
-                        f"Top Enriched Pathways in KRAS {mutation} Colorectal Adenocarcinoma\n(KEGG)",
+                        gsea_results, 
+                        title,
                         output_path,
-                        len(specific_cell_lines[mutation])
+                        len(comparison_data['mut'])
                     )
-                    logger.info(f"Successfully created pie chart for {mutation}")
-                except Exception as e:
-                    logger.error(f"Error creating pie chart for {mutation}: {str(e)}")
-                    logger.error("Traceback:", exc_info=True)
-            else:
-                logger.warning(f"No pathways found for pie chart creation for {mutation}")
+                    
+                else:
+                    logger.warning(f"No enriched pathways found for {comparison_name}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing comparison {comparison_name}: {str(e)}")
+                logger.error("Traceback:", exc_info=True)
+                continue
             
         logger.info("Analysis completed successfully")
         
